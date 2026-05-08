@@ -817,6 +817,10 @@ static const struct wl_keyboard_listener keyboard_listener = {
     keyboard_handle_repeat_info,
 };
 
+static void gesture_swipe_begin(struct display* display, uint32_t id);
+static void gesture_swipe_update(struct display* display, uint32_t axis, int value);
+static void gesture_swipe_end(struct display* display);
+
 static void
 pointer_handle_enter(void *data, struct wl_pointer *,
                      uint32_t serial, struct wl_surface *surface,
@@ -956,7 +960,8 @@ pointer_handle_axis(void *data, struct wl_pointer *,
     struct display* display = (struct display*)data;
     struct input_event event[2];
     struct timespec rt;
-    unsigned int res, move, n = 0;
+    unsigned int res, n = 0;
+    int move;
     double fVal = wl_fixed_to_double(value) / 10.0f;
     double step = 1.0f;
 
@@ -986,13 +991,17 @@ pointer_handle_axis(void *data, struct wl_pointer *,
                                      std::fmod(display->wheelAccumulatorY, step);
     }
 
+    if (display->wheelEvtIsTouchpad) {
+        gesture_swipe_update(display, axis, move);
+        return;
+    }
+
     if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
         ALOGE("%s:%d error in touch clock_gettime: %s",
               __FILE__, __LINE__, strerror(errno));
     }
 
-    ADD_EVENT(EV_REL, (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
-              ? REL_WHEEL : REL_HWHEEL, move);
+    ADD_EVENT(EV_REL, (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) ? REL_WHEEL : REL_HWHEEL, move);
     ADD_EVENT(EV_SYN, SYN_REPORT, 0);
 
     res = write(display->input_fd[INPUT_POINTER], &event, sizeof(event));
@@ -1005,11 +1014,19 @@ pointer_handle_axis_source(void *data, struct wl_pointer *, uint32_t source)
 {
     struct display* display = (struct display*)data;
     display->wheelEvtIsDiscrete = (source == WL_POINTER_AXIS_SOURCE_WHEEL);
+    display->wheelEvtIsTouchpad = (source == WL_POINTER_AXIS_SOURCE_FINGER);
+
+    if (display->wheelEvtIsTouchpad)
+        gesture_swipe_begin(display, display->pointer_enter_serial);
 }
 
 static void
-pointer_handle_axis_stop(void *, struct wl_pointer *, uint32_t, uint32_t)
+pointer_handle_axis_stop(void *data, struct wl_pointer *, uint32_t, uint32_t)
 {
+    struct display* display = (struct display*)data;
+
+    if (display->wheelEvtIsTouchpad)
+        gesture_swipe_end(display);
 }
 
 static void
@@ -1295,6 +1312,92 @@ static const struct wl_touch_listener touch_listener = {
 };
 
 static void
+gesture_swipe_begin(struct display* display, uint32_t id) {
+    // Do not interrupt active gestures
+    if (!empty_touch_id(display))
+        return;
+
+    display->gesturePoints[0] = create_touch_id(display, id);
+    display->gesturePosX = display->ptrPrvX;
+    display->gesturePosY = display->ptrPrvY;
+    display->gestureLength = -1;
+}
+
+static void
+gesture_swipe_update(struct display* display, uint32_t axis, int value) {
+    struct input_event event[12];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (display->gesturePoints[0] == -1)
+        return;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    if (display->gestureLength == -1) {
+        ADD_EVENT(EV_ABS, ABS_MT_SLOT, display->gesturePoints[0]);
+        ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, display->gesturePoints[0]);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->gesturePosX);
+        ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->gesturePosY);
+        ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+        ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+    }
+
+    display->gestureLength = value * display->scrollSensitivity;
+    if (axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL) {
+        display->gesturePosX += display->gestureLength;
+    } else {
+        display->gesturePosY += display->gestureLength;
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, display->gesturePoints[0]);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, display->gesturePoints[0]);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_X, display->gesturePosX);
+    ADD_EVENT(EV_ABS, ABS_MT_POSITION_Y, display->gesturePosY);
+    ADD_EVENT(EV_ABS, ABS_MT_PRESSURE, 50);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
+static void
+gesture_swipe_end(struct display* display) {
+    struct input_event event[3];
+    struct timespec rt;
+    unsigned int res, n = 0;
+
+    if (display->gesturePoints[0] == -1)
+        return;
+
+    if (ensure_pipe(display, INPUT_TOUCH))
+        return;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &rt) == -1) {
+        ALOGE("%s:%d error in touch clock_gettime: %s",
+              __FILE__, __LINE__, strerror(errno));
+    }
+
+    ADD_EVENT(EV_ABS, ABS_MT_SLOT, display->gesturePoints[0]);
+    ADD_EVENT(EV_ABS, ABS_MT_TRACKING_ID, -1);
+    ADD_EVENT(EV_SYN, SYN_REPORT, 0);
+
+    flush_touch_id(display, display->touch_id[display->gesturePoints[0]]);
+    display->gesturePoints[0] = -1;
+
+    res = write(display->input_fd[INPUT_TOUCH], &event, sizeof(event));
+    if (res < sizeof(event))
+        ALOGE("Failed to write event for InputFlinger: %s", strerror(errno));
+}
+
+static void
 gesture_pinch_begin(void *data, struct zwp_pointer_gesture_pinch_v1 *, uint32_t id, uint32_t, struct wl_surface *, uint32_t)
 {
     struct display* display = (struct display*)data;
@@ -1439,6 +1542,7 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t wl_caps)
         d->ptrPrvX = 0;
         d->ptrPrvY = 0;
         d->reverseScroll = property_get_bool("persist.waydroid.reverse_scrolling", false);
+        d->scrollSensitivity = property_get_int32("persist.waydroid.scroll_sensitivity", 25);
         d->zoomSensitivity = property_get_int32("persist.waydroid.zoom_sensitivity", 120);
         d->gesturePoints[0] = d->gesturePoints[1] = -1;
         mkfifo(INPUT_PIPE_NAME[INPUT_POINTER], S_IRWXO | S_IRWXG | S_IRWXU);
