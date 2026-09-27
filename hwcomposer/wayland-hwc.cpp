@@ -1374,6 +1374,8 @@ static bool any_window_visible(struct display *display) {
 }
 
 static void set_screen_state(struct display *display, bool on) {
+    if (property_get_int32("persist.waydroid.unfocused_doze_ms", kUnfocusedDozeDefaultMs) == 0)
+        return;
     if (display->screen_on == on)
         return;
     display->screen_on = on;
