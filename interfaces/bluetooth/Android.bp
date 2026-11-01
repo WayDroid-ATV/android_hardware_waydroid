@@ -1,0 +1,19 @@
+aidl_interface {
+    name: "vendor.waydroid.bluetooth",
+    vendor_available: true,
+    srcs: [
+        "vendor/waydroid/bluetooth/IBluetoothProxy.aidl",
+    ],
+    stability: "vintf",
+    backend: {
+        cpp: {
+            enabled: false,
+        },
+        ndk: {
+            enabled: true,
+        },
+        java: {
+            enabled: true,
+        },
+    },
+}
